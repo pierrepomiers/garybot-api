@@ -4,10 +4,12 @@ Proxy Odoo SaaS via XML-RPC + endpoints pour le frontend GaryBot
 Déployer sur Render.com
 """
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 import xmlrpc.client
 import os
+from datetime import datetime, timedelta
+from typing import Optional
 
 app = FastAPI(title="GaryBot API")
 
@@ -65,23 +67,30 @@ def health():
 
 
 @app.get("/orders", dependencies=[Depends(check_auth)])
-def get_orders():
+def get_orders(since: Optional[str] = Query(None, description="ISO timestamp pour delta sync (ex: 2025-01-01T00:00:00)")):
     """
     Commandes de vente Odoo :
     - Validées (state = sale)
     - Non entièrement livrées
     - Avec au moins une facture (acompte)
     Enrichies avec lignes, client, adresse de livraison.
+
+    Delta sync : passer ?since=TIMESTAMP pour ne récupérer que les commandes
+    modifiées après ce timestamp.
     """
     uid = get_odoo_uid()
 
-    # 1. Commandes
+    # 1. Commandes (avec filtre delta sync optionnel)
+    domain = [
+        ["state", "=", "sale"],
+        ["invoice_status", "in", ["invoiced", "to invoice"]],
+        ["delivery_status", "!=", "full"],
+    ]
+    if since:
+        domain.append(["write_date", ">", since])
+
     orders = odoo_search_read(uid, "sale.order",
-        domain=[
-            ["state", "=", "sale"],
-            ["invoice_status", "in", ["invoiced", "to invoice"]],
-            ["delivery_status", "!=", "full"],
-        ],
+        domain=domain,
         fields=[
             "id", "name", "date_order", "state",
             "partner_id", "partner_shipping_id",
@@ -94,51 +103,101 @@ def get_orders():
         order="date_order desc"
     )
 
+    if not orders:
+        return {"orders": [], "count": 0, "sync_timestamp": datetime.utcnow().isoformat()}
+
+    # 2. Batch : collecter tous les IDs à récupérer
+    all_line_ids = []
+    all_partner_ids = set()
+    for order in orders:
+        all_line_ids.extend(order.get("order_line", []))
+        if order.get("partner_id"):
+            all_partner_ids.add(order["partner_id"][0])
+        shipping = order.get("partner_shipping_id", [])
+        if shipping:
+            all_partner_ids.add(shipping[0])
+
+    # 3. Batch : un seul appel pour toutes les lignes
+    lines_by_order = {}
+    if all_line_ids:
+        all_lines = odoo_search_read(uid, "sale.order.line",
+            domain=[["id", "in", all_line_ids]],
+            fields=["id", "order_id", "product_id", "product_uom_qty", "price_unit",
+                    "price_subtotal", "name", "qty_delivered", "qty_invoiced"],
+            limit=5000
+        )
+        for line in all_lines:
+            oid = line["order_id"][0] if line.get("order_id") else None
+            if oid:
+                lines_by_order.setdefault(oid, []).append(line)
+
+    # 4. Batch : un seul appel pour tous les partenaires (clients + adresses)
+    partners_by_id = {}
+    if all_partner_ids:
+        all_partners = odoo_search_read(uid, "res.partner",
+            domain=[["id", "in", list(all_partner_ids)]],
+            fields=["id", "name", "email", "phone",
+                    "street", "city", "zip", "country_id"],
+            limit=5000
+        )
+        for p in all_partners:
+            partners_by_id[p["id"]] = p
+
+    # 5. Assembler les données côté Python
     enriched = []
     for order in orders:
-
-        # 2. Lignes de commande
-        line_ids = order.get("order_line", [])
-        lines_data = []
-        if line_ids:
-            lines_data = odoo_search_read(uid, "sale.order.line",
-                domain=[["id", "in", line_ids]],
-                fields=["id", "product_id", "product_uom_qty", "price_unit",
-                        "price_subtotal", "name", "qty_delivered", "qty_invoiced"]
-            )
-
-        # 3. Client
         partner_id = order["partner_id"][0] if order.get("partner_id") else None
-        partner_data = {}
-        if partner_id:
-            partners = odoo_search_read(uid, "res.partner",
-                domain=[["id", "=", partner_id]],
-                fields=["id", "name", "email", "phone",
-                        "street", "city", "zip", "country_id"]
-            )
-            if partners:
-                partner_data = partners[0]
+        shipping_id = order["partner_shipping_id"][0] if order.get("partner_shipping_id") else None
 
-        # 4. Adresse de livraison (si différente)
-        shipping = order.get("partner_shipping_id", [])
+        partner_data = partners_by_id.get(partner_id, {})
         shipping_data = {}
-        if shipping and shipping[0] != partner_id:
-            shippings = odoo_search_read(uid, "res.partner",
-                domain=[["id", "=", shipping[0]]],
-                fields=["id", "name", "street", "city", "zip",
-                        "country_id", "email", "phone"]
-            )
-            if shippings:
-                shipping_data = shippings[0]
+        if shipping_id and shipping_id != partner_id:
+            shipping_data = partners_by_id.get(shipping_id, {})
 
         enriched.append({
             **order,
-            "lines_detail":   lines_data,
+            "lines_detail":   lines_by_order.get(order["id"], []),
             "partner_detail": partner_data,
             "shipping_detail": shipping_data or partner_data,
         })
 
-    return {"orders": enriched, "count": len(enriched)}
+    return {"orders": enriched, "count": len(enriched), "sync_timestamp": datetime.utcnow().isoformat()}
+
+
+@app.get("/stats", dependencies=[Depends(check_auth)])
+def get_stats():
+    """
+    Statistiques de livraison : nombre de commandes livrées (delivery_status = full)
+    groupé par mois sur les 12 derniers mois.
+    """
+    uid = get_odoo_uid()
+
+    twelve_months_ago = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d 00:00:00")
+
+    delivered = odoo_search_read(uid, "sale.order",
+        domain=[
+            ["delivery_status", "=", "full"],
+            ["date_order", ">=", twelve_months_ago],
+        ],
+        fields=["id", "date_order"],
+        limit=5000,
+        order="date_order asc"
+    )
+
+    # Grouper par mois (YYYY-MM)
+    by_month: dict[str, int] = {}
+    for order in delivered:
+        date_str = order.get("date_order", "")
+        if date_str:
+            month_key = date_str[:7]  # "2025-03"
+            by_month[month_key] = by_month.get(month_key, 0) + 1
+
+    return {
+        "total_delivered": len(delivered),
+        "by_month": by_month,
+        "period_start": twelve_months_ago[:10],
+        "period_end": datetime.utcnow().strftime("%Y-%m-%d"),
+    }
 
 
 @app.get("/config", dependencies=[Depends(check_auth)])
