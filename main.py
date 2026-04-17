@@ -44,7 +44,7 @@ def get_odoo_uid():
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Connexion Odoo impossible : {str(e)}")
 
-def odoo_search_read(uid, model, domain, fields, limit=200, order="date_order desc"):
+def odoo_search_read(uid, model, domain, fields, limit=200, order=None):
     """Appel XML-RPC search_read"""
     try:
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
@@ -52,7 +52,7 @@ def odoo_search_read(uid, model, domain, fields, limit=200, order="date_order de
             ODOO_DB, uid, ODOO_API_KEY,
             model, "search_read",
             [domain],
-            {"fields": fields, "limit": limit, "order": order}
+            {"fields": fields, "limit": limit, **({"order": order} if order else {})}
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Erreur Odoo ({model}) : {str(e)}")
@@ -90,7 +90,8 @@ def get_orders():
             "invoice_status", "delivery_status",
             "commitment_date", "note",
             "team_id", "user_id",
-        ]
+        ],
+        order="date_order desc"
     )
 
     enriched = []
@@ -103,8 +104,7 @@ def get_orders():
             lines_data = odoo_search_read(uid, "sale.order.line",
                 domain=[["id", "in", line_ids]],
                 fields=["id", "product_id", "product_uom_qty", "price_unit",
-                        "price_subtotal", "name", "qty_delivered", "qty_invoiced"],
-                order="id asc"
+                        "price_subtotal", "name", "qty_delivered", "qty_invoiced"]
             )
 
         # 3. Client
