@@ -1,5 +1,5 @@
 """
-GaryBot Backend - FastAPI v3
+MichelBot Backend - FastAPI v3
 Proxy Odoo SaaS + endpoints archivage/purge
 Déployer sur Render.com
 """
@@ -11,7 +11,7 @@ import httpx
 import os
 from typing import Optional
 
-app = FastAPI(title="GaryBot API")
+app = FastAPI(title="MichelBot API")
 
 # ─── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -27,7 +27,7 @@ ODOO_URL     = os.environ.get("ODOO_URL", "")       # ex: https://notox.odoo.com
 ODOO_DB      = os.environ.get("ODOO_DB", "")        # ex: notox
 ODOO_USER    = os.environ.get("ODOO_USER", "")      # email admin Odoo
 ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")   # clé API Odoo
-API_SECRET   = os.environ.get("API_SECRET", "garybot-secret")
+API_SECRET   = os.environ.get("API_SECRET", "michelbot-secret")
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 def check_auth(x_api_secret: str = Header(...)):
@@ -70,7 +70,7 @@ async def odoo_search_read(client, cookies, model, domain, fields, limit=200, or
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "GaryBot API v3"}
+    return {"status": "ok", "service": "MichelBot API v3"}
 
 
 @app.get("/orders", dependencies=[Depends(check_auth)])
@@ -156,4 +156,15 @@ def get_config():
         "odoo_url":  ODOO_URL,
         "odoo_db":   ODOO_DB,
         "api_ready": bool(ODOO_URL and ODOO_DB and ODOO_USER and ODOO_API_KEY)
+    }
+
+@app.get("/debug")
+def debug():
+    """Endpoint temporaire pour vérifier les variables d'environnement"""
+    return {
+        "odoo_url":    ODOO_URL  or "VIDE",
+        "odoo_db":     ODOO_DB   or "VIDE",
+        "odoo_user":   ODOO_USER or "VIDE",
+        "api_key_set": bool(ODOO_API_KEY),
+        "api_key_len": len(ODOO_API_KEY),
     }
