@@ -59,7 +59,7 @@ def odoo_search_read(uid, model, domain, fields, limit=200, order=None):
 
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"status": "ok", "service": "GaryBot API v3"}
 
