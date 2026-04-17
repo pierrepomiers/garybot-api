@@ -113,7 +113,7 @@ def get_orders():
         if partner_id:
             partners = odoo_search_read(uid, "res.partner",
                 domain=[["id", "=", partner_id]],
-                fields=["id", "name", "email", "phone", "mobile",
+                fields=["id", "name", "email", "phone",
                         "street", "city", "zip", "country_id"]
             )
             if partners:
