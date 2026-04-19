@@ -218,37 +218,73 @@ async def get_order_pdf(order_id: int):
     """
     Télécharge le PDF d'un devis/commande Odoo.
 
-    Le endpoint /report/pdf n'est pas exposé via XML-RPC, donc on passe
-    par une session web : POST /web/session/authenticate (récupère le
-    cookie de session), puis GET /report/pdf/sale.report_saleorder/<id>.
+    Le endpoint /report/pdf n'est pas accessible via XML-RPC : on passe
+    par une session web. Les deux requêtes (auth + PDF) partagent le
+    même httpx.AsyncClient pour que les cookies de session récupérés
+    lors de l'auth soient automatiquement renvoyés sur le GET PDF.
     """
     password = ODOO_PASSWORD or ODOO_API_KEY
     if not (ODOO_URL and ODOO_DB and ODOO_USER and password):
         raise HTTPException(status_code=500, detail="Configuration Odoo incomplète")
 
+    print(f"[PDF] ▶ démarrage commande_id={order_id} user={ODOO_USER} db={ODOO_DB}", flush=True)
+
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            # ── 1. Authentification session web ──────────────────────────────
+            auth_url = f"{ODOO_URL}/web/session/authenticate"
+            print(f"[PDF] POST {auth_url}", flush=True)
             auth_resp = await client.post(
-                f"{ODOO_URL}/web/session/authenticate",
+                auth_url,
                 json={
                     "jsonrpc": "2.0",
                     "params": {"db": ODOO_DB, "login": ODOO_USER, "password": password},
                 },
                 headers={"Content-Type": "application/json"},
             )
+            cookie_names = list(auth_resp.cookies.keys()) or list(client.cookies.keys())
+            print(f"[PDF] ← auth status={auth_resp.status_code} cookies={cookie_names}", flush=True)
+
             if auth_resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Auth session Odoo : HTTP {auth_resp.status_code}")
-            auth_json = auth_resp.json()
-            if not (auth_json.get("result") or {}).get("uid"):
-                raise HTTPException(status_code=502, detail="Auth session Odoo refusée (vérifier ODOO_PASSWORD)")
 
-            pdf_resp = await client.get(f"{ODOO_URL}/report/pdf/sale.report_saleorder/{order_id}")
+            try:
+                auth_json = auth_resp.json()
+            except Exception as e:
+                print(f"[PDF] ✗ réponse auth non-JSON : {e} body={auth_resp.text[:200]!r}", flush=True)
+                raise HTTPException(status_code=502, detail="Réponse auth Odoo invalide")
+
+            result = auth_json.get("result") or {}
+            uid = result.get("uid")
+            print(f"[PDF] auth uid={uid} username={result.get('username')!r}", flush=True)
+            if not uid:
+                err = auth_json.get("error") or {}
+                print(f"[PDF] ✗ auth refusée : {err}", flush=True)
+                raise HTTPException(status_code=502, detail="Auth session Odoo refusée (vérifier ODOO_USER / ODOO_API_KEY)")
+
+            # ── 2. Téléchargement du PDF (même client → cookies réutilisés) ──
+            pdf_url = f"{ODOO_URL}/report/pdf/sale.report_saleorder/{order_id}"
+            print(f"[PDF] GET {pdf_url} (cookies client={list(client.cookies.keys())})", flush=True)
+            pdf_resp = await client.get(pdf_url)
+            ctype = pdf_resp.headers.get("content-type", "")
+            size = len(pdf_resp.content)
+            print(f"[PDF] ← pdf status={pdf_resp.status_code} content-type={ctype!r} size={size}o", flush=True)
+
             if pdf_resp.status_code != 200:
                 raise HTTPException(status_code=502, detail=f"Erreur génération PDF : HTTP {pdf_resp.status_code}")
+
+            if "application/pdf" not in ctype.lower():
+                # Odoo renvoie la page de login HTML quand la session n'est pas valide
+                preview = pdf_resp.text[:300] if ctype.startswith("text") else "(binaire)"
+                print(f"[PDF] ✗ content-type inattendu — aperçu : {preview!r}", flush=True)
+                raise HTTPException(status_code=502, detail=f"PDF non reçu (content-type={ctype}) — session Odoo non valide")
+
             pdf_bytes = pdf_resp.content
     except httpx.RequestError as e:
+        print(f"[PDF] ✗ erreur réseau : {e!r}", flush=True)
         raise HTTPException(status_code=502, detail=f"Connexion Odoo impossible : {str(e)}")
 
+    print(f"[PDF] ✓ commande_id={order_id} renvoyée ({len(pdf_bytes)} octets)", flush=True)
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
