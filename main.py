@@ -30,7 +30,7 @@ ODOO_URL      = os.environ.get("ODOO_URL", "")
 ODOO_DB       = os.environ.get("ODOO_DB", "")
 ODOO_USER     = os.environ.get("ODOO_USER", "")
 ODOO_API_KEY  = os.environ.get("ODOO_API_KEY", "")
-ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")  # pour session web (PDF) — fallback sur ODOO_API_KEY
+ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")  # mot de passe réel — requis pour /web/session/authenticate (PDF)
 API_SECRET    = os.environ.get("API_SECRET", "garybot-secret")
 
 # ─── AUTH GARYBOT ─────────────────────────────────────────────────────────────
@@ -223,9 +223,10 @@ async def get_order_pdf(order_id: int):
     même httpx.AsyncClient pour que les cookies de session récupérés
     lors de l'auth soient automatiquement renvoyés sur le GET PDF.
     """
-    password = ODOO_PASSWORD or ODOO_API_KEY
-    if not (ODOO_URL and ODOO_DB and ODOO_USER and password):
-        raise HTTPException(status_code=500, detail="Configuration Odoo incomplète")
+    # /web/session/authenticate n'accepte PAS les clés API Odoo — il faut
+    # un vrai mot de passe utilisateur (ODOO_API_KEY reste utilisé pour XML-RPC).
+    if not (ODOO_URL and ODOO_DB and ODOO_USER and ODOO_PASSWORD):
+        raise HTTPException(status_code=500, detail="Configuration Odoo incomplète (ODOO_PASSWORD requis pour le PDF)")
 
     print(f"[PDF] ▶ démarrage commande_id={order_id} user={ODOO_USER} db={ODOO_DB}", flush=True)
 
@@ -238,7 +239,7 @@ async def get_order_pdf(order_id: int):
                 auth_url,
                 json={
                     "jsonrpc": "2.0",
-                    "params": {"db": ODOO_DB, "login": ODOO_USER, "password": password},
+                    "params": {"db": ODOO_DB, "login": ODOO_USER, "password": ODOO_PASSWORD},
                 },
                 headers={"Content-Type": "application/json"},
             )
@@ -260,7 +261,7 @@ async def get_order_pdf(order_id: int):
             if not uid:
                 err = auth_json.get("error") or {}
                 print(f"[PDF] ✗ auth refusée : {err}", flush=True)
-                raise HTTPException(status_code=502, detail="Auth session Odoo refusée (vérifier ODOO_USER / ODOO_API_KEY)")
+                raise HTTPException(status_code=502, detail="Auth session Odoo refusée (vérifier ODOO_USER / ODOO_PASSWORD)")
 
             # ── 2. Téléchargement du PDF (même client → cookies réutilisés) ──
             pdf_url = f"{ODOO_URL}/report/pdf/sale.report_saleorder/{order_id}"
