@@ -6,8 +6,11 @@ Déployer sur Render.com
 
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import xmlrpc.client
 import os
+import io
+import httpx
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -23,11 +26,12 @@ app.add_middleware(
 )
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-ODOO_URL     = os.environ.get("ODOO_URL", "")
-ODOO_DB      = os.environ.get("ODOO_DB", "")
-ODOO_USER    = os.environ.get("ODOO_USER", "")
-ODOO_API_KEY = os.environ.get("ODOO_API_KEY", "")
-API_SECRET   = os.environ.get("API_SECRET", "garybot-secret")
+ODOO_URL      = os.environ.get("ODOO_URL", "")
+ODOO_DB       = os.environ.get("ODOO_DB", "")
+ODOO_USER     = os.environ.get("ODOO_USER", "")
+ODOO_API_KEY  = os.environ.get("ODOO_API_KEY", "")
+ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")  # pour session web (PDF) — fallback sur ODOO_API_KEY
+API_SECRET    = os.environ.get("API_SECRET", "garybot-secret")
 
 # ─── AUTH GARYBOT ─────────────────────────────────────────────────────────────
 def check_auth(x_api_secret: str = Header(...)):
@@ -207,6 +211,49 @@ def get_config():
         "odoo_db":   ODOO_DB,
         "api_ready": bool(ODOO_URL and ODOO_DB and ODOO_USER and ODOO_API_KEY)
     }
+
+
+@app.get("/orders/{order_id}/pdf", dependencies=[Depends(check_auth)])
+async def get_order_pdf(order_id: int):
+    """
+    Télécharge le PDF d'un devis/commande Odoo.
+
+    Le endpoint /report/pdf n'est pas exposé via XML-RPC, donc on passe
+    par une session web : POST /web/session/authenticate (récupère le
+    cookie de session), puis GET /report/pdf/sale.report_saleorder/<id>.
+    """
+    password = ODOO_PASSWORD or ODOO_API_KEY
+    if not (ODOO_URL and ODOO_DB and ODOO_USER and password):
+        raise HTTPException(status_code=500, detail="Configuration Odoo incomplète")
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+            auth_resp = await client.post(
+                f"{ODOO_URL}/web/session/authenticate",
+                json={
+                    "jsonrpc": "2.0",
+                    "params": {"db": ODOO_DB, "login": ODOO_USER, "password": password},
+                },
+                headers={"Content-Type": "application/json"},
+            )
+            if auth_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Auth session Odoo : HTTP {auth_resp.status_code}")
+            auth_json = auth_resp.json()
+            if not (auth_json.get("result") or {}).get("uid"):
+                raise HTTPException(status_code=502, detail="Auth session Odoo refusée (vérifier ODOO_PASSWORD)")
+
+            pdf_resp = await client.get(f"{ODOO_URL}/report/pdf/sale.report_saleorder/{order_id}")
+            if pdf_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Erreur génération PDF : HTTP {pdf_resp.status_code}")
+            pdf_bytes = pdf_resp.content
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Connexion Odoo impossible : {str(e)}")
+
+    return StreamingResponse(
+        io.BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="commande-{order_id}.pdf"'},
+    )
 
 
 @app.get("/debug")
