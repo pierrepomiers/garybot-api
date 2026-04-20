@@ -76,6 +76,24 @@ def odoo_search_read(uid, model, domain, fields, limit=200, order=None):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Erreur Odoo ({model}) : {str(e)}")
 
+
+_AUTHOR_PARTNER_ID_CACHE: dict[int, int] = {}
+
+
+def get_author_partner_id(uid, models):
+    """res.partner lié au user XML-RPC — force une bulle verte (auteur interne)."""
+    cached = _AUTHOR_PARTNER_ID_CACHE.get(uid)
+    if cached is not None:
+        return cached
+    user_data = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY,
+        "res.users", "read",
+        [[uid], ["partner_id"]],
+    )
+    partner_id = user_data[0]["partner_id"][0]
+    _AUTHOR_PARTNER_ID_CACHE[uid] = partner_id
+    return partner_id
+
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
 
 @app.api_route("/health", methods=["GET", "HEAD"])
@@ -494,7 +512,7 @@ class MessageIn(BaseModel):
     attachments: list[AttachmentIn] = []
 
 
-EMAIL_FROM_DEFAULT = '"NOTOX" <contact@notox.fr>'
+EMAIL_FROM_DEFAULT = '"NOTOX" <pierre@notoxsurf.com>'
 
 
 @app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
@@ -510,6 +528,7 @@ def post_order_message(order_id: int, payload: MessageIn):
     uid = get_odoo_uid()
     try:
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+        author_partner_id = get_author_partner_id(uid, models)
 
         attachment_ids: list[int] = []
         for att in payload.attachments:
@@ -554,6 +573,7 @@ def post_order_message(order_id: int, payload: MessageIn):
             "message_type": "comment",
             "auto_delete": False,
             "reply_to_force_new": False,
+            "author_id": author_partner_id,
             "email_from": EMAIL_FROM_DEFAULT,
         }
 
