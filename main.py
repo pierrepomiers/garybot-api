@@ -528,8 +528,9 @@ def post_order_message(order_id: int, payload: MessageIn):
         kwargs = {
             "body": payload.body,
             "subject": payload.subject or False,
-            "message_type": "comment",
+            "message_type": "email",
             "subtype_xmlid": "mail.mt_comment",
+            "email_from": "GREEN WAVE SAS <pierre@notoxsurf.com>",
             "partner_ids": [int(payload.partner_id)],
         }
         if attachment_ids:
