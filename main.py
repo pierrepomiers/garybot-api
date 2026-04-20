@@ -12,11 +12,20 @@ import os
 import io
 import base64
 import html
+import traceback
 from datetime import datetime, timedelta
 from typing import Optional
 from pathlib import Path
 
-from weasyprint import HTML
+# Import défensif : si les libs système (pango/cairo/gdk-pixbuf) manquent, on veut
+# que l'app démarre quand même — seul l'endpoint PDF renverra alors une erreur claire.
+try:
+    from weasyprint import HTML as _WeasyHTML
+    _WEASYPRINT_IMPORT_ERROR: Optional[str] = None
+except Exception as _e:  # ImportError, OSError (libs natives manquantes), etc.
+    _WeasyHTML = None  # type: ignore[assignment]
+    _WEASYPRINT_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+    print(f"[PDF] ✗ import weasyprint échoué : {_WEASYPRINT_IMPORT_ERROR}", flush=True)
 
 app = FastAPI(title="GaryBot API")
 
@@ -443,10 +452,25 @@ def get_order_pdf(order_id: int):
 
     html_doc = _build_order_html(order, lines, partner, user_name)
 
+    if _WeasyHTML is None:
+        # Libs natives manquantes au démarrage — message déjà loggué à l'import.
+        print(f"[PDF] ✗ weasyprint indisponible (import échoué) : {_WEASYPRINT_IMPORT_ERROR}", flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"weasyprint indisponible — {_WEASYPRINT_IMPORT_ERROR}",
+        )
+
+    print(f"[PDF] ▶ génération commande_id={order_id} name={order.get('name')!r} lignes={len(lines)} html={len(html_doc)}o", flush=True)
     try:
-        pdf_bytes = HTML(string=html_doc).write_pdf()
+        pdf_bytes = _WeasyHTML(string=html_doc).write_pdf()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur génération PDF : {str(e)}")
+        tb = traceback.format_exc()
+        print(f"[PDF] ✗ weasyprint.write_pdf() : {type(e).__name__}: {e}\n{tb}", flush=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur génération PDF ({type(e).__name__}) : {str(e)}",
+        )
+    print(f"[PDF] ✓ commande_id={order_id} rendue ({len(pdf_bytes)} octets)", flush=True)
 
     filename = f"commande-{order.get('name') or order_id}.pdf"
     return StreamingResponse(
