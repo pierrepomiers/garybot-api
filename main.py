@@ -494,16 +494,19 @@ class MessageIn(BaseModel):
     attachments: list[AttachmentIn] = []
 
 
+EMAIL_FROM_DEFAULT = '"NOTOX" <contact@notox.fr>'
+
+
 @app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
 def post_order_message(order_id: int, payload: MessageIn):
     """
-    Envoie un email au partenaire via un `mail.template` temporaire et le
-    loggue dans le chatter de la commande.
+    Envoie un email HTML formaté au partenaire via `mail.compose.message`
+    en mode `comment`. Le composer archive automatiquement le message dans
+    le chatter de la sale.order, préserve le HTML brut et relaie les
+    pièces jointes.
 
-    Le sanitizer d'Odoo échappait le HTML quand il venait de message_post
-    via XML-RPC. Passer par un template (champ body_html) contourne le
-    problème : Odoo rend le HTML tel quel car le champ est de type html
-    côté mail.template. Le template est créé puis supprimé dans la foulée.
+    Remplace l'ancien flux mail.template.send_mail qui ne portait pas le
+    HTML ni les PJ correctement.
     """
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body vide")
@@ -512,6 +515,7 @@ def post_order_message(order_id: int, payload: MessageIn):
     try:
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
+        # 1. Créer les ir.attachment pour les photos uploadées.
         attachment_ids: list[int] = []
         for att in payload.attachments:
             if not att.data:
@@ -537,104 +541,71 @@ def post_order_message(order_id: int, payload: MessageIn):
             '</div>'
         )
 
-        # 1. Récupérer l'id du modèle sale.order.
-        model_rows = models.execute_kw(
+        # 2. Résoudre subtype_id = mail.mt_comment (pour que le message
+        #    apparaisse dans le chatter comme un vrai commentaire/email).
+        ref = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
-            "ir.model", "search_read",
-            [[["model", "=", "sale.order"]]],
-            {"fields": ["id"], "limit": 1},
+            "ir.model.data", "check_object_reference",
+            ["mail", "mt_comment"],
         )
-        if not model_rows:
-            raise HTTPException(status_code=502, detail="Modèle sale.order introuvable dans ir.model")
-        sale_order_model_id = model_rows[0]["id"]
+        # check_object_reference renvoie (model_str, record_id).
+        subtype_comment_id = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ref
 
-        # 2. Récupérer l'email du partenaire (résolution explicite — évite
-        #    de dépendre de la syntaxe de templating Odoo, qui varie selon
-        #    les versions : ${...} avant 17, {{ ... }} depuis).
-        partner_rows = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY,
-            "res.partner", "read",
-            [[partner_id]], {"fields": ["email"]},
-        )
-        partner_email = partner_rows[0].get("email") if partner_rows else None
-        if not partner_email:
-            raise HTTPException(status_code=400, detail=f"Partenaire {partner_id} sans email")
-
-        template_values = {
-            "name": f"garybot_tmp_{order_id}_{int(datetime.utcnow().timestamp())}",
-            "model_id": sale_order_model_id,
+        # 3. Créer le composer en mode comment, lié à la sale.order.
+        composer_vals = {
+            "composition_mode": "comment",
+            "model": "sale.order",
+            "res_ids": [order_id],
             "subject": subject,
-            "body_html": body_html,
-            "email_to": partner_email,
+            "body": body_html,
+            "partner_ids": [(6, 0, [partner_id])],
+            "attachment_ids": [(6, 0, attachment_ids)] if attachment_ids else [(6, 0, [])],
+            "subtype_id": subtype_comment_id,
+            "message_type": "comment",
+            "auto_delete": False,
+            "reply_to_force_new": False,
+            "email_from": EMAIL_FROM_DEFAULT,
         }
-        if attachment_ids:
-            template_values["attachment_ids"] = [(6, 0, attachment_ids)]
+
+        context = {
+            "default_model": "sale.order",
+            "default_res_ids": [order_id],
+            "default_composition_mode": "comment",
+            "mail_post_autofollow": True,
+            "mail_notify_force_send": True,
+        }
 
         print(
-            f"[MSG] → template temporaire order_id={order_id} "
-            f"partner_id={partner_id} email={partner_email!r} "
+            f"[MSG] → compose.message order_id={order_id} partner_id={partner_id} "
+            f"subtype_id={subtype_comment_id} attachments={len(attachment_ids)} "
             f"body_len={len(body_html)} body={body_html!r}",
             flush=True,
         )
 
-        template_id = models.execute_kw(
+        composer_id = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
-            "mail.template", "create",
-            [template_values],
+            "mail.compose.message", "create",
+            [composer_vals],
+            {"context": context},
         )
 
-        try:
-            # 3. Envoyer immédiatement : force_send=True bypass la queue mail.
-            mail_id = models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                "mail.template", "send_mail",
-                [template_id],
-                {"res_id": order_id, "force_send": True},
-            )
-            print(
-                f"[MSG] ✓ send_mail template_id={template_id} mail_id={mail_id} "
-                f"attachments={len(attachment_ids)}",
-                flush=True,
-            )
-        finally:
-            # 4. Supprimer le template temporaire dans tous les cas.
-            try:
-                models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY,
-                    "mail.template", "unlink",
-                    [[template_id]],
-                )
-                print(f"[MSG] ✓ template {template_id} supprimé", flush=True)
-            except Exception as ex_unlink:
-                print(f"[MSG] ⚠ unlink template {template_id} échoué : {ex_unlink}", flush=True)
+        # 4. Déclencher l'envoi (Odoo 19 : action_send_mail).
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            "mail.compose.message", "action_send_mail",
+            [[composer_id]],
+            {"context": context},
+        )
 
-        # 5. Archiver dans le chatter (note interne, sans notification —
-        #    l'email au client a déjà été envoyé par send_mail).
-        chatter_message_id: Optional[int] = None
-        try:
-            chatter_message_id = models.execute_kw(
-                ODOO_DB, uid, ODOO_API_KEY,
-                "sale.order", "message_post",
-                [[order_id]],
-                {
-                    "body": payload.body,
-                    "subject": subject,
-                    "message_type": "comment",
-                    "subtype_xmlid": "mail.mt_note",
-                },
-            )
-            print(
-                f"[MSG] ✓ chatter archive message_id={chatter_message_id}",
-                flush=True,
-            )
-        except Exception as ex_chatter:
-            print(f"[MSG] ⚠ chatter archive échoué : {ex_chatter}", flush=True)
+        print(
+            f"[MSG] ✓ compose.message sent composer_id={composer_id} "
+            f"order_id={order_id} attachments={len(attachment_ids)}",
+            flush=True,
+        )
 
         return {
             "success": True,
-            "mail_id": mail_id,
-            "chatter_message_id": chatter_message_id,
-            "template_id_temporary": template_id,
+            "composer_id": composer_id,
             "attachment_ids": attachment_ids,
         }
     except HTTPException:
@@ -642,7 +613,7 @@ def post_order_message(order_id: int, payload: MessageIn):
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[MSG] ✗ commande_id={order_id} : {type(e).__name__}: {e}\n{tb}", flush=True)
-        raise HTTPException(status_code=502, detail=f"Erreur Odoo message_post : {str(e)}")
+        raise HTTPException(status_code=502, detail=f"Erreur Odoo message send : {str(e)}")
 
 
 @app.get("/debug")
