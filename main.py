@@ -488,7 +488,7 @@ class AttachmentIn(BaseModel):
 
 
 class MessageIn(BaseModel):
-    body: str = Field(..., description="Corps du message en texte brut (Odoo gère l'affichage)")
+    body: str = Field(..., description="Corps du message en texte brut")
     subject: str = ""
     partner_id: int
     attachments: list[AttachmentIn] = []
@@ -500,13 +500,9 @@ EMAIL_FROM_DEFAULT = '"NOTOX" <contact@notox.fr>'
 @app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
 def post_order_message(order_id: int, payload: MessageIn):
     """
-    Envoie un email HTML formaté au partenaire via `mail.compose.message`
-    en mode `comment`. Le composer archive automatiquement le message dans
-    le chatter de la sale.order, préserve le HTML brut et relaie les
-    pièces jointes.
-
-    Remplace l'ancien flux mail.template.send_mail qui ne portait pas le
-    HTML ni les PJ correctement.
+    Envoie un email HTML au partenaire via `mail.compose.message` en mode
+    `comment` : archive dans le chatter du sale.order, préserve le HTML
+    brut et relaie les pièces jointes.
     """
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body vide")
@@ -515,7 +511,6 @@ def post_order_message(order_id: int, payload: MessageIn):
     try:
         models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
 
-        # 1. Créer les ir.attachment pour les photos uploadées.
         attachment_ids: list[int] = []
         for att in payload.attachments:
             if not att.data:
@@ -536,22 +531,17 @@ def post_order_message(order_id: int, payload: MessageIn):
         partner_id = int(payload.partner_id)
         subject = payload.subject or "Message NOTOX"
         body_html = (
-            '<div style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;">\n'
-            f'{payload.body.replace(chr(10), "<br>")}\n'
+            '<div style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;">'
+            f'{payload.body.replace(chr(10), "<br>")}'
             '</div>'
         )
 
-        # 2. Résoudre subtype_id = mail.mt_comment (pour que le message
-        #    apparaisse dans le chatter comme un vrai commentaire/email).
-        ref = models.execute_kw(
+        _, subtype_comment_id = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
             "ir.model.data", "check_object_reference",
             ["mail", "mt_comment"],
         )
-        # check_object_reference renvoie (model_str, record_id).
-        subtype_comment_id = ref[1] if isinstance(ref, (list, tuple)) and len(ref) > 1 else ref
 
-        # 3. Créer le composer en mode comment, lié à la sale.order.
         composer_vals = {
             "composition_mode": "comment",
             "model": "sale.order",
@@ -559,7 +549,7 @@ def post_order_message(order_id: int, payload: MessageIn):
             "subject": subject,
             "body": body_html,
             "partner_ids": [(6, 0, [partner_id])],
-            "attachment_ids": [(6, 0, attachment_ids)] if attachment_ids else [(6, 0, [])],
+            "attachment_ids": [(6, 0, attachment_ids)],
             "subtype_id": subtype_comment_id,
             "message_type": "comment",
             "auto_delete": False,
@@ -575,13 +565,6 @@ def post_order_message(order_id: int, payload: MessageIn):
             "mail_notify_force_send": True,
         }
 
-        print(
-            f"[MSG] → compose.message order_id={order_id} partner_id={partner_id} "
-            f"subtype_id={subtype_comment_id} attachments={len(attachment_ids)} "
-            f"body_len={len(body_html)} body={body_html!r}",
-            flush=True,
-        )
-
         composer_id = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
             "mail.compose.message", "create",
@@ -589,7 +572,6 @@ def post_order_message(order_id: int, payload: MessageIn):
             {"context": context},
         )
 
-        # 4. Déclencher l'envoi (Odoo 19 : action_send_mail).
         models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
             "mail.compose.message", "action_send_mail",
@@ -598,8 +580,8 @@ def post_order_message(order_id: int, payload: MessageIn):
         )
 
         print(
-            f"[MSG] ✓ compose.message sent composer_id={composer_id} "
-            f"order_id={order_id} attachments={len(attachment_ids)}",
+            f"[MSG] ✓ order_id={order_id} partner_id={partner_id} "
+            f"composer_id={composer_id} attachments={len(attachment_ids)}",
             flush=True,
         )
 
@@ -612,7 +594,7 @@ def post_order_message(order_id: int, payload: MessageIn):
         raise
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[MSG] ✗ commande_id={order_id} : {type(e).__name__}: {e}\n{tb}", flush=True)
+        print(f"[MSG] ✗ order_id={order_id} : {type(e).__name__}: {e}\n{tb}", flush=True)
         raise HTTPException(status_code=502, detail=f"Erreur Odoo message send : {str(e)}")
 
 
