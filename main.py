@@ -497,17 +497,13 @@ class MessageIn(BaseModel):
 @app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
 def post_order_message(order_id: int, payload: MessageIn):
     """
-    Poste un message sur la commande Odoo (chatter) et notifie le partenaire
-    via `mail.mt_comment`. Retour à XML-RPC message_post (mail.message.create
-    renvoyait AccessError sur Odoo SaaS).
+    Envoie un email au partenaire via un `mail.template` temporaire et le
+    loggue dans le chatter de la commande.
 
-    MODE DEBUG : on exécute DEUX variantes de message_post dans le même appel
-    pour comparer le rendu Odoo :
-      - A : body texte brut (\\n natifs) + body_type='text'
-      - B : body HTML (<div>+<br>) + subtype_xmlid + email_layout_xmlid
-    Les deux réponses sont loguées et renvoyées côté client. ⚠ Chaque appel
-    crée 2 messages dans le chatter et envoie 2 emails au partenaire —
-    utiliser contre un partner_id de test.
+    Le sanitizer d'Odoo échappait le HTML quand il venait de message_post
+    via XML-RPC. Passer par un template (champ body_html) contourne le
+    problème : Odoo rend le HTML tel quel car le champ est de type html
+    côté mail.template. Le template est créé puis supprimé dans la foulée.
     """
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body vide")
@@ -534,75 +530,88 @@ def post_order_message(order_id: int, payload: MessageIn):
             attachment_ids.append(att_id)
 
         partner_id = int(payload.partner_id)
-        subject = payload.subject or False
-        body_text = payload.body
+        subject = payload.subject or "Message NOTOX"
         body_html = (
             '<div style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;">\n'
-            f'{body_text.replace(chr(10), "<br>")}\n'
+            f'{payload.body.replace(chr(10), "<br>")}\n'
             '</div>'
         )
 
-        def _call_message_post(label: str, kwargs: dict):
-            """Appelle message_post, loggue la requête et la réponse, renvoie un dict résultat."""
-            print(
-                f"[MSG:{label}] → message_post order_id={order_id} "
-                f"kwargs={ {k: (v if k != 'body' else f'<{len(v)} chars>') for k, v in kwargs.items()} } "
-                f"body={kwargs.get('body')!r}",
-                flush=True,
-            )
-            try:
-                mid = models.execute_kw(
-                    ODOO_DB, uid, ODOO_API_KEY,
-                    "sale.order", "message_post",
-                    [[order_id]],
-                    kwargs,
-                )
-                print(f"[MSG:{label}] ✓ response={mid!r} (type={type(mid).__name__})", flush=True)
-                return {"variant": label, "ok": True, "response": mid}
-            except Exception as ex:
-                err = f"{type(ex).__name__}: {ex}"
-                print(f"[MSG:{label}] ✗ error={err}", flush=True)
-                return {"variant": label, "ok": False, "error": err}
+        # 1. Récupérer l'id du modèle sale.order.
+        model_rows = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            "ir.model", "search_read",
+            [[["model", "=", "sale.order"]]],
+            {"fields": ["id"], "limit": 1},
+        )
+        if not model_rows:
+            raise HTTPException(status_code=502, detail="Modèle sale.order introuvable dans ir.model")
+        sale_order_model_id = model_rows[0]["id"]
 
-        # Variante A : texte brut avec \n natifs + body_type='text'
-        kwargs_a = {
-            "body": body_text,
-            "body_type": "text",
+        # 2. Récupérer l'email du partenaire (résolution explicite — évite
+        #    de dépendre de la syntaxe de templating Odoo, qui varie selon
+        #    les versions : ${...} avant 17, {{ ... }} depuis).
+        partner_rows = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            "res.partner", "read",
+            [[partner_id]], {"fields": ["email"]},
+        )
+        partner_email = partner_rows[0].get("email") if partner_rows else None
+        if not partner_email:
+            raise HTTPException(status_code=400, detail=f"Partenaire {partner_id} sans email")
+
+        template_values = {
+            "name": f"garybot_tmp_{order_id}_{int(datetime.utcnow().timestamp())}",
+            "model_id": sale_order_model_id,
             "subject": subject,
-            "message_type": "comment",
-            "subtype_xmlid": "mail.mt_comment",
-            "partner_ids": [partner_id],
+            "body_html": body_html,
+            "email_to": partner_email,
         }
         if attachment_ids:
-            kwargs_a["attachment_ids"] = attachment_ids
-
-        # Variante B : HTML + subtype_xmlid + email_layout_xmlid
-        kwargs_b = {
-            "body": body_html,
-            "subject": subject,
-            "message_type": "comment",
-            "subtype_xmlid": "mail.mt_comment",
-            "email_layout_xmlid": "mail.mail_notification_light",
-            "partner_ids": [partner_id],
-        }
-        if attachment_ids:
-            kwargs_b["attachment_ids"] = attachment_ids
-
-        result_a = _call_message_post("A", kwargs_a)
-        result_b = _call_message_post("B", kwargs_b)
+            template_values["attachment_ids"] = [(6, 0, attachment_ids)]
 
         print(
-            f"[MSG] ⇢ recap order_id={order_id} A_ok={result_a.get('ok')} "
-            f"B_ok={result_b.get('ok')} attachments={len(attachment_ids)}",
+            f"[MSG] → template temporaire order_id={order_id} "
+            f"partner_id={partner_id} email={partner_email!r} "
+            f"body_len={len(body_html)} body={body_html!r}",
             flush=True,
         )
 
-        success = bool(result_a.get("ok") or result_b.get("ok"))
+        template_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            "mail.template", "create",
+            [template_values],
+        )
+
+        try:
+            # 3. Envoyer (rend le template, crée un mail.mail, force_send => envoi immédiat).
+            mail_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                "mail.template", "send_mail",
+                [template_id, order_id],
+                {"force_send": True},
+            )
+            print(
+                f"[MSG] ✓ send_mail template_id={template_id} mail_id={mail_id} "
+                f"attachments={len(attachment_ids)}",
+                flush=True,
+            )
+        finally:
+            # 4. Supprimer le template temporaire dans tous les cas.
+            try:
+                models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY,
+                    "mail.template", "unlink",
+                    [[template_id]],
+                )
+                print(f"[MSG] ✓ template {template_id} supprimé", flush=True)
+            except Exception as ex_unlink:
+                print(f"[MSG] ⚠ unlink template {template_id} échoué : {ex_unlink}", flush=True)
+
         return {
-            "success": success,
-            "debug_mode": "A_plaintext_vs_B_html_layout",
-            "variant_A": result_a,
-            "variant_B": result_b,
+            "success": True,
+            "mail_id": mail_id,
+            "template_id_temporary": template_id,
             "attachment_ids": attachment_ids,
         }
     except HTTPException:
