@@ -13,6 +13,7 @@ import os
 import io
 import base64
 import html
+import httpx
 import traceback
 from datetime import datetime, timedelta
 from typing import Optional
@@ -495,11 +496,15 @@ class MessageIn(BaseModel):
 
 
 @app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
-def post_order_message(order_id: int, payload: MessageIn):
+async def post_order_message(order_id: int, payload: MessageIn):
     """
     Poste un message sur la commande Odoo (chatter) et notifie le partenaire
-    indiqué par email via `mail.mt_comment`. Les pièces jointes sont créées
-    comme `ir.attachment` puis liées au message.
+    indiqué par email via `mail.mt_comment`.
+
+    Les pièces jointes sont créées via XML-RPC (`ir.attachment.create`), puis
+    le `message_post` est appelé via l'API REST d'Odoo 19 (Bearer token) —
+    ce canal préserve correctement le HTML (<br>, accents) contrairement à
+    XML-RPC qui avait posé des soucis d'encodage/échappement.
     """
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body vide")
@@ -525,34 +530,51 @@ def post_order_message(order_id: int, payload: MessageIn):
             )
             attachment_ids.append(att_id)
 
-        body = payload.body
+        # Conversion texte brut → HTML (uniquement les sauts de ligne).
+        body = payload.body.replace("\r\n", "\n").replace("\n", "<br>")
 
-        kwargs = {
+        rest_payload = {
             "body": body,
-            "body_is_html": False,
             "subject": payload.subject or False,
             "message_type": "comment",
             "subtype_xmlid": "mail.mt_comment",
             "partner_ids": [int(payload.partner_id)],
         }
         if attachment_ids:
-            kwargs["attachment_ids"] = attachment_ids
+            rest_payload["attachment_ids"] = attachment_ids
 
         print(
-            f"[MSG] → Odoo message_post order_id={order_id} "
+            f"[MSG] → Odoo REST message_post order_id={order_id} "
             f"subject={payload.subject!r} partner_id={payload.partner_id} "
-            f"body_len={len(body)} body={body!r} (body_is_html=False)",
+            f"body_len={len(body)} body={body!r}",
             flush=True,
         )
 
-        message_id = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY,
-            "sale.order", "message_post",
-            [[order_id]],
-            kwargs,
-        )
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{ODOO_URL}/api/sale.order/{order_id}/message_post",
+                headers={
+                    "Authorization": f"Bearer {ODOO_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=rest_payload,
+            )
 
-        print(f"[MSG] ✓ commande_id={order_id} message_id={message_id} attachments={len(attachment_ids)}", flush=True)
+        if resp.status_code >= 400:
+            print(
+                f"[MSG] ✗ REST order_id={order_id} status={resp.status_code} "
+                f"body_resp={resp.text[:500]!r}",
+                flush=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Erreur Odoo REST message_post ({resp.status_code}) : {resp.text[:300]}",
+            )
+
+        data = resp.json() if resp.content else {}
+        message_id = data.get("id") or data.get("message_id") or data
+
+        print(f"[MSG] ✓ REST commande_id={order_id} message_id={message_id} attachments={len(attachment_ids)}", flush=True)
         return {"success": True, "message_id": message_id, "attachment_ids": attachment_ids}
     except HTTPException:
         raise
