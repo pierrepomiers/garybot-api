@@ -7,6 +7,7 @@ Déployer sur Render.com
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 import xmlrpc.client
 import os
 import io
@@ -478,6 +479,77 @@ def get_order_pdf(order_id: int):
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ─── MESSAGE ODOO (chatter + email client) ────────────────────────────────────
+class AttachmentIn(BaseModel):
+    name: str
+    data: str  # base64 (sans préfixe data:)
+
+
+class MessageIn(BaseModel):
+    body: str = Field(..., description="Corps HTML du message")
+    subject: str = ""
+    partner_id: int
+    attachments: list[AttachmentIn] = []
+
+
+@app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
+def post_order_message(order_id: int, payload: MessageIn):
+    """
+    Poste un message sur la commande Odoo (chatter) et notifie le partenaire
+    indiqué par email via `mail.mt_comment`. Les pièces jointes sont créées
+    comme `ir.attachment` puis liées au message.
+    """
+    if not payload.body.strip():
+        raise HTTPException(status_code=400, detail="body vide")
+
+    uid = get_odoo_uid()
+    try:
+        models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object")
+
+        attachment_ids: list[int] = []
+        for att in payload.attachments:
+            if not att.data:
+                continue
+            att_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                "ir.attachment", "create",
+                [{
+                    "name": att.name or "attachment",
+                    "datas": att.data,
+                    "res_model": "sale.order",
+                    "res_id": order_id,
+                    "type": "binary",
+                }],
+            )
+            attachment_ids.append(att_id)
+
+        kwargs = {
+            "body": payload.body,
+            "subject": payload.subject or False,
+            "message_type": "comment",
+            "subtype_xmlid": "mail.mt_comment",
+            "partner_ids": [int(payload.partner_id)],
+        }
+        if attachment_ids:
+            kwargs["attachment_ids"] = attachment_ids
+
+        message_id = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            "sale.order", "message_post",
+            [[order_id]],
+            kwargs,
+        )
+
+        print(f"[MSG] ✓ commande_id={order_id} message_id={message_id} attachments={len(attachment_ids)}", flush=True)
+        return {"success": True, "message_id": message_id, "attachment_ids": attachment_ids}
+    except HTTPException:
+        raise
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[MSG] ✗ commande_id={order_id} : {type(e).__name__}: {e}\n{tb}", flush=True)
+        raise HTTPException(status_code=502, detail=f"Erreur Odoo message_post : {str(e)}")
 
 
 @app.get("/debug")
