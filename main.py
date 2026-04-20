@@ -571,6 +571,7 @@ def post_order_message(order_id: int, payload: MessageIn):
             "auto_delete": False,
             "reply_to_force_new": False,
             "author_id": author_partner_id,
+            "reply_to": '"Pierre Pomiers" <pierre@notoxsurf.com>',
         }
 
         context = {
