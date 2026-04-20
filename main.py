@@ -536,28 +536,40 @@ def post_order_message(order_id: int, payload: MessageIn):
             '</div>'
         )
 
-        kwargs = {
+        # Résoudre le subtype_id de mail.mt_comment (fallback: 1).
+        subtype_rows = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY,
+            "mail.message.subtype", "search_read",
+            [[["xml_id", "=", "mail.mt_comment"]]],
+            {"fields": ["id"], "limit": 1},
+        )
+        subtype_id = subtype_rows[0]["id"] if subtype_rows else 1
+
+        partner_id = int(payload.partner_id)
+
+        values = {
             "body": body_html,
-            "subject": payload.subject or False,
+            "model": "sale.order",
+            "res_id": order_id,
             "message_type": "comment",
-            "subtype_xmlid": "mail.mt_comment",
-            "partner_ids": [int(payload.partner_id)],
+            "subtype_id": subtype_id,
+            "partner_ids": [(4, partner_id)],
+            "subject": payload.subject or False,
         }
         if attachment_ids:
-            kwargs["attachment_ids"] = attachment_ids
+            values["attachment_ids"] = [(4, aid) for aid in attachment_ids]
 
         print(
-            f"[MSG] → Odoo message_post order_id={order_id} "
-            f"subject={payload.subject!r} partner_id={payload.partner_id} "
-            f"body_len={len(body_html)} body={body_html!r}",
+            f"[MSG] → Odoo mail.message create order_id={order_id} "
+            f"subject={payload.subject!r} partner_id={partner_id} "
+            f"subtype_id={subtype_id} body_len={len(body_html)} body={body_html!r}",
             flush=True,
         )
 
         message_id = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
-            "sale.order", "message_post",
-            [[order_id]],
-            kwargs,
+            "mail.message", "create",
+            [values],
         )
 
         print(f"[MSG] ✓ commande_id={order_id} message_id={message_id} attachments={len(attachment_ids)}", flush=True)
