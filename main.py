@@ -512,9 +512,6 @@ class MessageIn(BaseModel):
     attachments: list[AttachmentIn] = []
 
 
-EMAIL_FROM_DEFAULT = '"NOTOX" <pierre@notoxsurf.com>'
-
-
 @app.post("/orders/{order_id}/message", dependencies=[Depends(check_auth)])
 def post_order_message(order_id: int, payload: MessageIn):
     """
@@ -574,7 +571,6 @@ def post_order_message(order_id: int, payload: MessageIn):
             "auto_delete": False,
             "reply_to_force_new": False,
             "author_id": author_partner_id,
-            "email_from": EMAIL_FROM_DEFAULT,
         }
 
         context = {
