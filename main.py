@@ -10,9 +10,13 @@ from fastapi.responses import StreamingResponse
 import xmlrpc.client
 import os
 import io
-import httpx
+import base64
+import html
 from datetime import datetime, timedelta
 from typing import Optional
+from pathlib import Path
+
+from weasyprint import HTML
 
 app = FastAPI(title="GaryBot API")
 
@@ -30,7 +34,6 @@ ODOO_URL      = os.environ.get("ODOO_URL", "")
 ODOO_DB       = os.environ.get("ODOO_DB", "")
 ODOO_USER     = os.environ.get("ODOO_USER", "")
 ODOO_API_KEY  = os.environ.get("ODOO_API_KEY", "")
-ODOO_PASSWORD = os.environ.get("ODOO_PASSWORD", "")  # mot de passe réel — requis pour /web/session/authenticate (PDF)
 API_SECRET    = os.environ.get("API_SECRET", "garybot-secret")
 
 # ─── AUTH GARYBOT ─────────────────────────────────────────────────────────────
@@ -127,7 +130,8 @@ def get_orders(since: Optional[str] = Query(None, description="ISO timestamp pou
         all_lines = odoo_search_read(uid, "sale.order.line",
             domain=[["id", "in", all_line_ids]],
             fields=["id", "order_id", "product_id", "product_uom_qty", "price_unit",
-                    "price_subtotal", "name", "qty_delivered", "qty_invoiced"],
+                    "price_subtotal", "name", "qty_delivered", "qty_invoiced",
+                    "discount", "price_tax"],
             limit=5000
         )
         for line in all_lines:
@@ -213,83 +217,242 @@ def get_config():
     }
 
 
+# ─── LOGO (encodé en base64 au démarrage pour éviter tout I/O par requête) ────
+_LOGO_PATH = Path(__file__).parent / "NOTOX_VERT_BD.png"
+try:
+    LOGO_B64 = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
+except FileNotFoundError:
+    LOGO_B64 = ""
+
+
+def _fmt_money(x: float) -> str:
+    """Format monétaire FR : 1 234,56 €"""
+    try:
+        s = f"{float(x):,.2f}"
+    except (TypeError, ValueError):
+        return "0,00 €"
+    return s.replace(",", " ").replace(".", ",") + " €"
+
+
+def _fmt_qty(x: float) -> str:
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return "0"
+    return (f"{f:.2f}".rstrip("0").rstrip(".")).replace(".", ",") or "0"
+
+
+def _fmt_date(iso: str) -> str:
+    if not iso:
+        return ""
+    try:
+        return datetime.strptime(iso[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return iso[:10]
+
+
+def _build_order_html(order: dict, lines: list, partner: dict, user_name: str) -> str:
+    """Construit le HTML du devis/commande au format interne NOTOX."""
+    order_name = html.escape(order.get("name") or "")
+    date_order = _fmt_date(order.get("date_order") or "")
+    vendeur = html.escape(user_name or "")
+
+    partner_name = html.escape(partner.get("name") or "")
+    partner_street = html.escape(partner.get("street") or "")
+    partner_city = html.escape(partner.get("city") or "")
+    partner_zip = html.escape(partner.get("zip") or "")
+    country = partner.get("country_id")
+    partner_country = html.escape(country[1] if isinstance(country, list) and len(country) > 1 else "")
+
+    # Séparer les vraies lignes produit des notes (price_unit=0 et product_id=false)
+    rows_html = []
+    amount_untaxed = 0.0
+    amount_tax = 0.0
+
+    for line in lines:
+        price_unit = float(line.get("price_unit") or 0)
+        product_id = line.get("product_id")
+        is_note = (not product_id) and price_unit == 0
+
+        if is_note:
+            # Note / détail — affichée en italique sous la ligne précédente
+            note_text = html.escape(line.get("name") or "").replace("\n", "<br>")
+            rows_html.append(
+                f'<tr class="note-row"><td colspan="6"><em>{note_text}</em></td></tr>'
+            )
+            continue
+
+        qty = float(line.get("product_uom_qty") or 0)
+        discount = float(line.get("discount") or 0)
+        price_subtotal = float(line.get("price_subtotal") or 0)
+        price_tax = float(line.get("price_tax") or 0)
+        amount_untaxed += price_subtotal
+        amount_tax += price_tax
+
+        desc = html.escape(line.get("name") or "").replace("\n", "<br>")
+        rows_html.append(
+            "<tr>"
+            f'<td class="desc">{desc}</td>'
+            f'<td class="num">{_fmt_qty(qty)}</td>'
+            f'<td class="num">{_fmt_money(price_unit)}</td>'
+            f'<td class="num">{_fmt_qty(discount)}%</td>'
+            f'<td class="num">{_fmt_money(price_tax)}</td>'
+            f'<td class="num">{_fmt_money(price_subtotal)}</td>'
+            "</tr>"
+        )
+
+    # Totaux : préférer les valeurs Odoo si présentes
+    amount_total_odoo = order.get("amount_total")
+    amount_untaxed_odoo = order.get("amount_untaxed")
+    total_ht = float(amount_untaxed_odoo) if amount_untaxed_odoo is not None else amount_untaxed
+    total_ttc = float(amount_total_odoo) if amount_total_odoo is not None else (amount_untaxed + amount_tax)
+    total_tax = total_ttc - total_ht
+
+    logo_src = f"data:image/png;base64,{LOGO_B64}" if LOGO_B64 else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="fr"><head><meta charset="utf-8"><title>Commande {order_name}</title>
+<style>
+  @page {{ size: A4; margin: 18mm 16mm 18mm 16mm; }}
+  body {{ font-family: "Helvetica", "Arial", sans-serif; font-size: 10pt; color: #222; }}
+  .header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }}
+  .header img {{ max-height: 70px; }}
+  .company {{ text-align: right; font-size: 9pt; line-height: 1.4; }}
+  .company b {{ color: #006633; font-size: 10pt; }}
+  .client {{ margin: 20px 0 24px 0; padding: 10px 0; }}
+  .client .label {{ font-size: 8pt; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }}
+  .client .name {{ font-weight: bold; font-size: 11pt; }}
+  h1.title {{ color: #006633; font-size: 20pt; margin: 16px 0 12px 0; font-weight: bold; }}
+  .infos {{ display: flex; gap: 40px; margin-bottom: 20px; font-size: 10pt; }}
+  .infos .col {{ flex: 1; }}
+  .infos .label {{ font-size: 8pt; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 2px; }}
+  table.lines {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+  table.lines thead th {{ background: #006633; color: #fff; font-weight: bold; padding: 8px 6px; text-align: left; font-size: 9pt; }}
+  table.lines thead th.num {{ text-align: right; }}
+  table.lines tbody td {{ padding: 7px 6px; border-bottom: 1px solid #e0e0e0; vertical-align: top; }}
+  table.lines tbody td.num {{ text-align: right; white-space: nowrap; }}
+  table.lines tbody td.desc {{ width: 42%; }}
+  tr.note-row td {{ border-bottom: 1px solid #e0e0e0; padding-top: 0; padding-left: 14px; color: #555; font-size: 9pt; }}
+  .totals {{ margin-top: 18px; width: 45%; margin-left: auto; }}
+  .totals tr td {{ padding: 5px 6px; }}
+  .totals tr td.label {{ text-align: right; color: #555; }}
+  .totals tr td.value {{ text-align: right; white-space: nowrap; }}
+  .totals tr.grand td {{ font-weight: bold; color: #006633; font-size: 12pt; border-top: 2px solid #006633; padding-top: 8px; }}
+</style></head>
+<body>
+  <div class="header">
+    {'<img src="' + logo_src + '" alt="NOTOX">' if logo_src else '<div></div>'}
+    <div class="company">
+      <b>GREEN WAVE SAS</b><br>
+      6 RUE DU LAZARET<br>
+      64600 ANGLET<br>
+      France
+    </div>
+  </div>
+
+  <div class="client">
+    <div class="label">Client</div>
+    <div class="name">{partner_name}</div>
+    <div>{partner_street}</div>
+    <div>{partner_zip} {partner_city}</div>
+    <div>{partner_country}</div>
+  </div>
+
+  <h1 class="title">Commande # {order_name}</h1>
+
+  <div class="infos">
+    <div class="col">
+      <div class="label">Date de commande</div>
+      <div>{date_order}</div>
+    </div>
+    <div class="col">
+      <div class="label">Vendeur</div>
+      <div>{vendeur}</div>
+    </div>
+  </div>
+
+  <table class="lines">
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th class="num">Quantité</th>
+        <th class="num">Prix unitaire</th>
+        <th class="num">Rem.%</th>
+        <th class="num">TVA</th>
+        <th class="num">Montant</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(rows_html)}
+    </tbody>
+  </table>
+
+  <table class="totals">
+    <tr><td class="label">Montant HT</td><td class="value">{_fmt_money(total_ht)}</td></tr>
+    <tr><td class="label">TVA</td><td class="value">{_fmt_money(total_tax)}</td></tr>
+    <tr class="grand"><td class="label">Total</td><td class="value">{_fmt_money(total_ttc)}</td></tr>
+  </table>
+</body></html>"""
+
+
 @app.get("/orders/{order_id}/pdf", dependencies=[Depends(check_auth)])
-async def get_order_pdf(order_id: int):
+def get_order_pdf(order_id: int):
     """
-    Télécharge le PDF d'un devis/commande Odoo.
-
-    Le endpoint /report/pdf n'est pas accessible via XML-RPC : on passe
-    par une session web. Les deux requêtes (auth + PDF) partagent le
-    même httpx.AsyncClient pour que les cookies de session récupérés
-    lors de l'auth soient automatiquement renvoyés sur le GET PDF.
+    Génère un PDF au format interne NOTOX à partir des données Odoo (XML-RPC).
+    Rendu via weasyprint, logo embarqué en base64.
     """
-    # /web/session/authenticate n'accepte PAS les clés API Odoo — il faut
-    # un vrai mot de passe utilisateur (ODOO_API_KEY reste utilisé pour XML-RPC).
-    if not (ODOO_URL and ODOO_DB and ODOO_USER and ODOO_PASSWORD):
-        raise HTTPException(status_code=500, detail="Configuration Odoo incomplète (ODOO_PASSWORD requis pour le PDF)")
+    uid = get_odoo_uid()
 
-    print(f"[PDF] ▶ démarrage commande_id={order_id} user={ODOO_USER} db={ODOO_DB}", flush=True)
+    orders = odoo_search_read(uid, "sale.order",
+        domain=[["id", "=", order_id]],
+        fields=[
+            "id", "name", "date_order", "state",
+            "partner_id", "amount_total", "amount_untaxed",
+            "order_line", "user_id",
+        ],
+        limit=1,
+    )
+    if not orders:
+        raise HTTPException(status_code=404, detail=f"Commande {order_id} introuvable")
+    order = orders[0]
+
+    line_ids = order.get("order_line") or []
+    lines = []
+    if line_ids:
+        lines = odoo_search_read(uid, "sale.order.line",
+            domain=[["id", "in", line_ids]],
+            fields=["id", "product_id", "product_uom_qty", "price_unit",
+                    "price_subtotal", "price_tax", "discount", "name"],
+            limit=500,
+            order="id asc",
+        )
+
+    partner = {}
+    if order.get("partner_id"):
+        partner_res = odoo_search_read(uid, "res.partner",
+            domain=[["id", "=", order["partner_id"][0]]],
+            fields=["id", "name", "street", "city", "zip", "country_id"],
+            limit=1,
+        )
+        if partner_res:
+            partner = partner_res[0]
+
+    user_name = ""
+    if order.get("user_id") and isinstance(order["user_id"], list) and len(order["user_id"]) > 1:
+        user_name = order["user_id"][1]
+
+    html_doc = _build_order_html(order, lines, partner, user_name)
 
     try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            # ── 1. Authentification session web ──────────────────────────────
-            auth_url = f"{ODOO_URL}/web/session/authenticate"
-            print(f"[PDF] POST {auth_url}", flush=True)
-            auth_resp = await client.post(
-                auth_url,
-                json={
-                    "jsonrpc": "2.0",
-                    "params": {"db": ODOO_DB, "login": ODOO_USER, "password": ODOO_PASSWORD},
-                },
-                headers={"Content-Type": "application/json"},
-            )
-            cookie_names = list(auth_resp.cookies.keys()) or list(client.cookies.keys())
-            print(f"[PDF] ← auth status={auth_resp.status_code} cookies={cookie_names}", flush=True)
+        pdf_bytes = HTML(string=html_doc).write_pdf()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur génération PDF : {str(e)}")
 
-            if auth_resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Auth session Odoo : HTTP {auth_resp.status_code}")
-
-            try:
-                auth_json = auth_resp.json()
-            except Exception as e:
-                print(f"[PDF] ✗ réponse auth non-JSON : {e} body={auth_resp.text[:200]!r}", flush=True)
-                raise HTTPException(status_code=502, detail="Réponse auth Odoo invalide")
-
-            result = auth_json.get("result") or {}
-            uid = result.get("uid")
-            print(f"[PDF] auth uid={uid} username={result.get('username')!r}", flush=True)
-            if not uid:
-                err = auth_json.get("error") or {}
-                print(f"[PDF] ✗ auth refusée : {err}", flush=True)
-                raise HTTPException(status_code=502, detail="Auth session Odoo refusée (vérifier ODOO_USER / ODOO_PASSWORD)")
-
-            # ── 2. Téléchargement du PDF (même client → cookies réutilisés) ──
-            pdf_url = f"{ODOO_URL}/report/pdf/sale.report_saleorder/{order_id}"
-            print(f"[PDF] GET {pdf_url} (cookies client={list(client.cookies.keys())})", flush=True)
-            pdf_resp = await client.get(pdf_url)
-            ctype = pdf_resp.headers.get("content-type", "")
-            size = len(pdf_resp.content)
-            print(f"[PDF] ← pdf status={pdf_resp.status_code} content-type={ctype!r} size={size}o", flush=True)
-
-            if pdf_resp.status_code != 200:
-                raise HTTPException(status_code=502, detail=f"Erreur génération PDF : HTTP {pdf_resp.status_code}")
-
-            if "application/pdf" not in ctype.lower():
-                # Odoo renvoie la page de login HTML quand la session n'est pas valide
-                preview = pdf_resp.text[:300] if ctype.startswith("text") else "(binaire)"
-                print(f"[PDF] ✗ content-type inattendu — aperçu : {preview!r}", flush=True)
-                raise HTTPException(status_code=502, detail=f"PDF non reçu (content-type={ctype}) — session Odoo non valide")
-
-            pdf_bytes = pdf_resp.content
-    except httpx.RequestError as e:
-        print(f"[PDF] ✗ erreur réseau : {e!r}", flush=True)
-        raise HTTPException(status_code=502, detail=f"Connexion Odoo impossible : {str(e)}")
-
-    print(f"[PDF] ✓ commande_id={order_id} renvoyée ({len(pdf_bytes)} octets)", flush=True)
+    filename = f"commande-{order.get('name') or order_id}.pdf"
     return StreamingResponse(
         io.BytesIO(pdf_bytes),
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="commande-{order_id}.pdf"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
