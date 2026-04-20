@@ -488,7 +488,7 @@ class AttachmentIn(BaseModel):
 
 
 class MessageIn(BaseModel):
-    body: str = Field(..., description="Corps HTML du message")
+    body: str = Field(..., description="Corps du message en texte brut (Odoo gère l'affichage)")
     subject: str = ""
     partner_id: int
     attachments: list[AttachmentIn] = []
@@ -525,14 +525,13 @@ def post_order_message(order_id: int, payload: MessageIn):
             )
             attachment_ids.append(att_id)
 
-        body = f"<div>{payload.body}</div>"
+        body = payload.body
 
         kwargs = {
             "body": body,
             "subject": payload.subject or False,
-            "message_type": "email",
+            "message_type": "comment",
             "subtype_xmlid": "mail.mt_comment",
-            "email_from": "GREEN WAVE SAS <pierre@notoxsurf.com>",
             "partner_ids": [int(payload.partner_id)],
         }
         if attachment_ids:
