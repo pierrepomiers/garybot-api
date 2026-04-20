@@ -584,12 +584,12 @@ def post_order_message(order_id: int, payload: MessageIn):
         )
 
         try:
-            # 3. Envoyer (rend le template, crée un mail.mail, force_send => envoi immédiat).
+            # 3. Envoyer immédiatement : force_send=True bypass la queue mail.
             mail_id = models.execute_kw(
                 ODOO_DB, uid, ODOO_API_KEY,
                 "mail.template", "send_mail",
-                [template_id, order_id],
-                {"force_send": True},
+                [template_id],
+                {"res_id": order_id, "force_send": True},
             )
             print(
                 f"[MSG] ✓ send_mail template_id={template_id} mail_id={mail_id} "
@@ -608,9 +608,32 @@ def post_order_message(order_id: int, payload: MessageIn):
             except Exception as ex_unlink:
                 print(f"[MSG] ⚠ unlink template {template_id} échoué : {ex_unlink}", flush=True)
 
+        # 5. Archiver dans le chatter (note interne, sans notification —
+        #    l'email au client a déjà été envoyé par send_mail).
+        chatter_message_id: Optional[int] = None
+        try:
+            chatter_message_id = models.execute_kw(
+                ODOO_DB, uid, ODOO_API_KEY,
+                "sale.order", "message_post",
+                [[order_id]],
+                {
+                    "body": payload.body,
+                    "subject": subject,
+                    "message_type": "comment",
+                    "subtype_xmlid": "mail.mt_note",
+                },
+            )
+            print(
+                f"[MSG] ✓ chatter archive message_id={chatter_message_id}",
+                flush=True,
+            )
+        except Exception as ex_chatter:
+            print(f"[MSG] ⚠ chatter archive échoué : {ex_chatter}", flush=True)
+
         return {
             "success": True,
             "mail_id": mail_id,
+            "chatter_message_id": chatter_message_id,
             "template_id_temporary": template_id,
             "attachment_ids": attachment_ids,
         }
