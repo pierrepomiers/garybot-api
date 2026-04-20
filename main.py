@@ -498,11 +498,16 @@ class MessageIn(BaseModel):
 def post_order_message(order_id: int, payload: MessageIn):
     """
     Poste un message sur la commande Odoo (chatter) et notifie le partenaire
-    indiqué par email via `mail.mt_comment`.
+    via `mail.mt_comment`. Retour à XML-RPC message_post (mail.message.create
+    renvoyait AccessError sur Odoo SaaS).
 
-    On repasse par XML-RPC (l'API REST /api/... renvoyait 404 sur cette
-    instance). Le body texte brut est enveloppé dans un <div> stylé —
-    Odoo SaaS reconnaît alors le contenu comme HTML et ne l'échappe pas.
+    MODE DEBUG : on exécute DEUX variantes de message_post dans le même appel
+    pour comparer le rendu Odoo :
+      - A : body texte brut (\\n natifs) + body_type='text'
+      - B : body HTML (<div>+<br>) + subtype_xmlid + email_layout_xmlid
+    Les deux réponses sont loguées et renvoyées côté client. ⚠ Chaque appel
+    crée 2 messages dans le chatter et envoie 2 emails au partenaire —
+    utiliser contre un partner_id de test.
     """
     if not payload.body.strip():
         raise HTTPException(status_code=400, detail="body vide")
@@ -528,52 +533,78 @@ def post_order_message(order_id: int, payload: MessageIn):
             )
             attachment_ids.append(att_id)
 
-        # Wrap dans un <div> stylé : Odoo détecte ainsi le body comme HTML
-        # et n'échappe pas les <br> insérés à partir des \n.
+        partner_id = int(payload.partner_id)
+        subject = payload.subject or False
+        body_text = payload.body
         body_html = (
             '<div style="font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6;">\n'
-            f'{payload.body.replace(chr(10), "<br>")}\n'
+            f'{body_text.replace(chr(10), "<br>")}\n'
             '</div>'
         )
 
-        # Résoudre le subtype_id de mail.mt_comment (fallback: 1).
-        subtype_rows = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY,
-            "mail.message.subtype", "search_read",
-            [[["xml_id", "=", "mail.mt_comment"]]],
-            {"fields": ["id"], "limit": 1},
-        )
-        subtype_id = subtype_rows[0]["id"] if subtype_rows else 1
+        def _call_message_post(label: str, kwargs: dict):
+            """Appelle message_post, loggue la requête et la réponse, renvoie un dict résultat."""
+            print(
+                f"[MSG:{label}] → message_post order_id={order_id} "
+                f"kwargs={ {k: (v if k != 'body' else f'<{len(v)} chars>') for k, v in kwargs.items()} } "
+                f"body={kwargs.get('body')!r}",
+                flush=True,
+            )
+            try:
+                mid = models.execute_kw(
+                    ODOO_DB, uid, ODOO_API_KEY,
+                    "sale.order", "message_post",
+                    [[order_id]],
+                    kwargs,
+                )
+                print(f"[MSG:{label}] ✓ response={mid!r} (type={type(mid).__name__})", flush=True)
+                return {"variant": label, "ok": True, "response": mid}
+            except Exception as ex:
+                err = f"{type(ex).__name__}: {ex}"
+                print(f"[MSG:{label}] ✗ error={err}", flush=True)
+                return {"variant": label, "ok": False, "error": err}
 
-        partner_id = int(payload.partner_id)
-
-        values = {
-            "body": body_html,
-            "model": "sale.order",
-            "res_id": order_id,
+        # Variante A : texte brut avec \n natifs + body_type='text'
+        kwargs_a = {
+            "body": body_text,
+            "body_type": "text",
+            "subject": subject,
             "message_type": "comment",
-            "subtype_id": subtype_id,
-            "partner_ids": [(4, partner_id)],
-            "subject": payload.subject or False,
+            "subtype_xmlid": "mail.mt_comment",
+            "partner_ids": [partner_id],
         }
         if attachment_ids:
-            values["attachment_ids"] = [(4, aid) for aid in attachment_ids]
+            kwargs_a["attachment_ids"] = attachment_ids
+
+        # Variante B : HTML + subtype_xmlid + email_layout_xmlid
+        kwargs_b = {
+            "body": body_html,
+            "subject": subject,
+            "message_type": "comment",
+            "subtype_xmlid": "mail.mt_comment",
+            "email_layout_xmlid": "mail.mail_notification_light",
+            "partner_ids": [partner_id],
+        }
+        if attachment_ids:
+            kwargs_b["attachment_ids"] = attachment_ids
+
+        result_a = _call_message_post("A", kwargs_a)
+        result_b = _call_message_post("B", kwargs_b)
 
         print(
-            f"[MSG] → Odoo mail.message create order_id={order_id} "
-            f"subject={payload.subject!r} partner_id={partner_id} "
-            f"subtype_id={subtype_id} body_len={len(body_html)} body={body_html!r}",
+            f"[MSG] ⇢ recap order_id={order_id} A_ok={result_a.get('ok')} "
+            f"B_ok={result_b.get('ok')} attachments={len(attachment_ids)}",
             flush=True,
         )
 
-        message_id = models.execute_kw(
-            ODOO_DB, uid, ODOO_API_KEY,
-            "mail.message", "create",
-            [values],
-        )
-
-        print(f"[MSG] ✓ commande_id={order_id} message_id={message_id} attachments={len(attachment_ids)}", flush=True)
-        return {"success": True, "message_id": message_id, "attachment_ids": attachment_ids}
+        success = bool(result_a.get("ok") or result_b.get("ok"))
+        return {
+            "success": success,
+            "debug_mode": "A_plaintext_vs_B_html_layout",
+            "variant_A": result_a,
+            "variant_B": result_b,
+            "attachment_ids": attachment_ids,
+        }
     except HTTPException:
         raise
     except Exception as e:
