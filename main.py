@@ -526,9 +526,10 @@ def post_order_message(order_id: int, payload: MessageIn):
             attachment_ids.append(att_id)
 
         body = payload.body
+        body_binary = xmlrpc.client.Binary(body.encode("utf-8"))
 
         kwargs = {
-            "body": body,
+            "body": body_binary,
             "subject": payload.subject or False,
             "message_type": "comment",
             "subtype_xmlid": "mail.mt_comment",
@@ -540,7 +541,7 @@ def post_order_message(order_id: int, payload: MessageIn):
         print(
             f"[MSG] → Odoo message_post order_id={order_id} "
             f"subject={payload.subject!r} partner_id={payload.partner_id} "
-            f"body_len={len(body)} body={body!r}",
+            f"body_len={len(body)} body={body!r} (transport: xmlrpc.Binary)",
             flush=True,
         )
 
