@@ -535,6 +535,13 @@ def post_order_message(order_id: int, payload: MessageIn):
         if attachment_ids:
             kwargs["attachment_ids"] = attachment_ids
 
+        print(
+            f"[MSG] → Odoo message_post order_id={order_id} "
+            f"subject={payload.subject!r} partner_id={payload.partner_id} "
+            f"body_len={len(payload.body)} body={payload.body!r}",
+            flush=True,
+        )
+
         message_id = models.execute_kw(
             ODOO_DB, uid, ODOO_API_KEY,
             "sale.order", "message_post",
