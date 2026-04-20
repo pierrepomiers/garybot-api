@@ -525,8 +525,10 @@ def post_order_message(order_id: int, payload: MessageIn):
             )
             attachment_ids.append(att_id)
 
+        body = f"<div>{payload.body}</div>"
+
         kwargs = {
-            "body": payload.body,
+            "body": body,
             "subject": payload.subject or False,
             "message_type": "email",
             "subtype_xmlid": "mail.mt_comment",
@@ -539,7 +541,7 @@ def post_order_message(order_id: int, payload: MessageIn):
         print(
             f"[MSG] → Odoo message_post order_id={order_id} "
             f"subject={payload.subject!r} partner_id={payload.partner_id} "
-            f"body_len={len(payload.body)} body={payload.body!r}",
+            f"body_len={len(body)} body={body!r}",
             flush=True,
         )
 
