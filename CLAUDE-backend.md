@@ -1,7 +1,7 @@
 # NOTOX / GaryBot — Contexte projet
 
 > Document de référence pour Claude (Code & Chat). Lire en priorité avant toute intervention.
-> Mis à jour : 2026-04-20
+> Mis à jour : 2026-04-21
 
 ---
 
@@ -108,7 +108,8 @@ garybot/
 | `/config` | GET | `x-api-secret` | Check env vars Odoo |
 | `/orders/{id}/pdf` | GET | `x-api-secret` | Génère PDF commande (weasyprint, format interne NOTOX, logo embarqué) |
 | `/orders/{id}/message` | POST | `x-api-secret` | **Envoie email client via `mail.compose.message` en mode `comment`. Archive dans chatter Odoo.** |
-| `/debug` | GET | ❌ | Diagnostic env vars (sensible, à retirer en prod) |
+| `/supplier-cart/send` | POST | `x-api-secret` | **Envoie un panier fournisseur via SMTP Brevo (tableau HTML Article/Qté/Réf). Pas d'archivage Odoo, logs côté Supabase (`supplier_messages_log`).** |
+| `/debug` | GET | `x-api-secret` | Diagnostic env vars Odoo + SMTP (auth requise depuis 2026-04-21) |
 
 ### Auth backend
 Header `x-api-secret: notox2026` (ou valeur de la var `API_SECRET`).
@@ -120,7 +121,16 @@ ODOO_DB       = notoxsurf (ou nom réel de la base)
 ODOO_USER     = pierre@notoxsurf.com
 ODOO_API_KEY  = <clé API Odoo, PAS le mot de passe>
 API_SECRET    = notox2026
+
+# SMTP Brevo — uniquement pour /supplier-cart/send (pas les mails clients)
+SMTP_HOST     = smtp-relay.brevo.com
+SMTP_PORT     = 587
+SMTP_USER     = <login Brevo>
+SMTP_PASS     = <clé SMTP Brevo>
+SMTP_FROM     = "NOTOX" <contact@notoxsurf.com>
 ```
+
+Le code parse `SMTP_FROM` avec `parseaddr()` → `SMTP_FROM_HEADER` (avec display name, pour l'entête `From:`) et `SMTP_FROM_ENVELOPE` (email brut, pour le `MAIL FROM` SMTP aligné SPF/DKIM Brevo). Le `Reply-To` fournisseur est hardcodé à `contact@notoxsurf.com`, PAS configurable par fournisseur.
 
 ---
 
@@ -160,6 +170,35 @@ Défini dans `garybot/index.html` (ligne ~402). 11 étapes dans l'ordre :
 - Étape "Livraison" cochée → bannière d'archivage
 - **Auto-archive** après `ARCHIVE_DELAY_DAYS` = 15 jours
 - **Purge définitive** après `PURGE_DELAY_DAYS` = 30 jours (supprime de Supabase, reste dans Odoo)
+
+### Commandes fournisseurs (flow depuis 2026-04-21)
+
+Les 3 étapes `appro_blank`, `cmd_preshape`, `cmd_access` (déclarées avec `fourn:[...]` dans `STEPS`) ouvrent un modal "Préparer commande fournisseur" quand user clique le bouton 📦 à côté de l'étape (visible après `isDone`).
+
+Flow :
+1. Frontend lit `order.lines_detail` (enrichi par `/orders`, incluant `display_type`). Les `line_section` sont ignorées ; les `line_note` sont concaténées dans le libellé du produit précédent (les produits NOTOX sont souvent génériques, la vraie spec est dans la note).
+2. User coche les lignes à commander, ajuste les libellés, ajoute éventuellement des lignes manuelles, choisit un fournisseur parmi ceux déclarés dans `step.fourn`.
+3. "🧺 Ajouter au panier" → `insert` direct dans Supabase `supplier_cart_items` (`sent_at IS NULL`).
+4. "📨 Envoyer maintenant" → même insert, puis appel `POST /supplier-cart/send` avec uniquement les items juste insérés.
+
+Le backend compose le mail HTML (tableau Article/Qté/Réf commande), l'envoie via SMTP Brevo STARTTLS, retourne `batch_id` + `sent_at` + `subject` + `body_html`. Le frontend met ensuite à jour `supplier_cart_items.sent_at/batch_id` et insère une ligne dans `supplier_messages_log`.
+
+**Atomicité** (côté frontend, `sendSupplierBatch`) : l'envoi SMTP précède toute écriture Supabase. Si le backend renvoie une erreur, rien n'est écrit. Si le backend renvoie 200 mais qu'une écriture Supabase suivante échoue (RLS, réseau, etc.), le mail est déjà parti — le frontend affiche un toast WARNING explicite avec le `batch_id` et l'utilisateur doit purger manuellement les éventuels items restés en panier. Le cas n'est pas rollback-able puisque l'email est un effet de bord externe.
+
+Tables Supabase utilisées (cf §suivant).
+
+### Tables Supabase
+
+| Table | Rôle |
+|---|---|
+| `order_meta` | Métadonnées par commande (type livraison, priorité, archivé, emails_sent) |
+| `order_steps` | État par étape par commande (done, fournisseur, mail_sent, mail_relance) |
+| `order_history` | Journal d'actions |
+| `fournisseurs` | Config des 5 fournisseurs (Viral, Atua, Ben, FCS, Surf System). Colonnes étendues en 2026-04-21 : `key` (slug stable, unique), `cc[]`, `template_subject/header/footer`, `active`, `updated_at`. `mail_mode`/`mail_jour`/`mail_heure` existaient déjà mais sont désormais affichables dans Réglages (indicatif UI, pas d'auto-envoi). |
+| `supplier_cart_items` | Nouveau (2026-04-21). Items en panier ou envoyés. Clé vers `fournisseurs.key`. `source in ('odoo','manual')`. `sent_at IS NULL` = en panier ; une fois envoyé, `sent_at` + `batch_id` renseignés. |
+| `supplier_messages_log` | Nouveau (2026-04-21). Historique des batchs envoyés (un mail = une ligne). `batch_id` fait le lien avec les items du cart. |
+
+**Note RLS** : toutes les tables ont RLS activé avec policy `auth_all` (lecture/écriture pour tout user authentifié). Pas de multi-tenant pour l'instant.
 
 ---
 

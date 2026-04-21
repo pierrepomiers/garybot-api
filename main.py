@@ -7,14 +7,18 @@ Déployer sur Render.com
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field
 import xmlrpc.client
 import os
 import io
 import base64
 import html
+import smtplib
 import traceback
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import formataddr, make_msgid, parseaddr
 from typing import Optional
 from pathlib import Path
 
@@ -45,6 +49,19 @@ ODOO_DB       = os.environ.get("ODOO_DB", "")
 ODOO_USER     = os.environ.get("ODOO_USER", "")
 ODOO_API_KEY  = os.environ.get("ODOO_API_KEY", "")
 API_SECRET    = os.environ.get("API_SECRET", "garybot-secret")
+
+# SMTP Brevo (utilisé uniquement par /supplier-cart/send)
+SMTP_HOST     = os.environ.get("SMTP_HOST", "")
+SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587") or 587)
+SMTP_USER     = os.environ.get("SMTP_USER", "")
+SMTP_PASS     = os.environ.get("SMTP_PASS", "")
+SMTP_FROM     = os.environ.get("SMTP_FROM", "")  # ex: '"NOTOX" <contact@notoxsurf.com>'
+# SMTP_FROM_HEADER : valeur brute pour l'entête From: (avec display name)
+# SMTP_FROM_ENVELOPE : adresse seule pour le MAIL FROM SMTP (aligné SPF/DKIM Brevo)
+_SMTP_FROM_NAME, _SMTP_FROM_ADDR = parseaddr(SMTP_FROM)
+SMTP_FROM_HEADER   = SMTP_FROM or _SMTP_FROM_ADDR
+SMTP_FROM_ENVELOPE = _SMTP_FROM_ADDR
+SUPPLIER_REPLY_TO  = "contact@notoxsurf.com"
 
 # ─── AUTH GARYBOT ─────────────────────────────────────────────────────────────
 def check_auth(x_api_secret: str = Header(...)):
@@ -159,7 +176,7 @@ def get_orders(since: Optional[str] = Query(None, description="ISO timestamp pou
             domain=[["id", "in", all_line_ids]],
             fields=["id", "order_id", "product_id", "product_uom_qty", "price_unit",
                     "price_subtotal", "name", "qty_delivered", "qty_invoiced",
-                    "discount", "price_tax"],
+                    "discount", "price_tax", "display_type"],
             limit=5000
         )
         for line in all_lines:
@@ -615,13 +632,153 @@ def post_order_message(order_id: int, payload: MessageIn):
         raise HTTPException(status_code=502, detail=f"Erreur Odoo message send : {str(e)}")
 
 
-@app.get("/debug")
+# ─── MAIL FOURNISSEUR (SMTP Brevo) ────────────────────────────────────────────
+class CartItem(BaseModel):
+    id: str
+    product_label: str
+    qty: float
+    order_ref: Optional[str] = None
+
+
+class SupplierSendIn(BaseModel):
+    supplier_key: str
+    supplier_name: str
+    supplier_email: EmailStr
+    cc: list[EmailStr] = []
+    subject: str
+    header: str
+    footer: str
+    items: list[CartItem] = Field(..., min_length=1)
+    sent_by: Optional[str] = None
+
+
+def _plain_text_to_html_paragraph(txt: str) -> str:
+    return html.escape(txt or "").replace("\n", "<br>")
+
+
+def _build_supplier_body(header: str, footer: str, items: list[CartItem]) -> tuple[str, str]:
+    """Retourne (body_html, body_text) pour le mail fournisseur."""
+    rows_html: list[str] = []
+    rows_text: list[str] = []
+    for it in items:
+        label = html.escape(it.product_label or "").replace("\n", "<br>")
+        qty_s = (f"{it.qty:.2f}".rstrip("0").rstrip(".")) or "0"
+        ref = html.escape(it.order_ref or "")
+        rows_html.append(
+            "<tr>"
+            f'<td style="border:1px solid #ccc;padding:8px;">{label}</td>'
+            f'<td style="border:1px solid #ccc;padding:8px;text-align:right;">{qty_s}</td>'
+            f'<td style="border:1px solid #ccc;padding:8px;">{ref}</td>'
+            "</tr>"
+        )
+        rows_text.append(f"- {it.product_label} × {qty_s}" + (f"   ({it.order_ref})" if it.order_ref else ""))
+
+    body_html = (
+        '<div style="font-family: Arial, sans-serif; color:#222; font-size:14px; line-height:1.5;">'
+        f'<p>{_plain_text_to_html_paragraph(header)}</p>'
+        '<table style="border-collapse:collapse; width:100%; margin:16px 0;">'
+        '<thead>'
+        '<tr style="background:#f0f0f0;">'
+        '<th style="border:1px solid #ccc; padding:8px; text-align:left;">Article</th>'
+        '<th style="border:1px solid #ccc; padding:8px; text-align:right;">Qté</th>'
+        '<th style="border:1px solid #ccc; padding:8px; text-align:left;">Réf commande</th>'
+        '</tr>'
+        '</thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table>'
+        f'<p>{_plain_text_to_html_paragraph(footer)}</p>'
+        '</div>'
+    )
+    body_text = (header or "") + "\n\n" + "\n".join(rows_text) + "\n\n" + (footer or "")
+    return body_html, body_text
+
+
+@app.post("/supplier-cart/send", dependencies=[Depends(check_auth)])
+def post_supplier_cart_send(payload: SupplierSendIn):
+    """
+    Envoie un panier fournisseur par email via SMTP Brevo.
+    Le frontend a déjà lu les items dans Supabase et les passe en payload.
+    Le backend compose le HTML, envoie le mail et retourne batch_id + subject + body_html
+    pour que le frontend marque les items comme envoyés et log dans supplier_messages_log.
+    """
+    missing = [
+        name for name, val in (
+            ("SMTP_HOST", SMTP_HOST),
+            ("SMTP_USER", SMTP_USER),
+            ("SMTP_PASS", SMTP_PASS),
+            ("SMTP_FROM", SMTP_FROM),
+        ) if not val
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"SMTP non configuré : {', '.join(missing)} manquant",
+        )
+
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="items vide")
+
+    batch_id = str(uuid.uuid4())
+    body_html, body_text = _build_supplier_body(payload.header, payload.footer, payload.items)
+
+    msg = EmailMessage()
+    msg["Subject"] = payload.subject
+    msg["From"] = SMTP_FROM_HEADER
+    msg["To"] = formataddr((payload.supplier_name, str(payload.supplier_email)))
+    if payload.cc:
+        msg["Cc"] = ", ".join(str(c) for c in payload.cc)
+    msg["Reply-To"] = SUPPLIER_REPLY_TO
+    msg["Message-ID"] = make_msgid(domain="notoxsurf.com")
+    msg.set_content(body_text)
+    msg.add_alternative(body_html, subtype="html")
+
+    rcpts: list[str] = [str(payload.supplier_email)] + [str(c) for c in payload.cc]
+
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg, from_addr=SMTP_FROM_ENVELOPE, to_addrs=rcpts)
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"[SUPPLIER] ✗ auth SMTP échouée : {e}", flush=True)
+        raise HTTPException(status_code=502, detail=f"Auth SMTP échouée : {e}")
+    except smtplib.SMTPException as e:
+        print(f"[SUPPLIER] ✗ SMTPException : {type(e).__name__}: {e}", flush=True)
+        raise HTTPException(status_code=502, detail=f"Erreur SMTP : {type(e).__name__}: {e}")
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[SUPPLIER] ✗ {type(e).__name__}: {e}\n{tb}", flush=True)
+        raise HTTPException(status_code=502, detail=f"Erreur envoi : {type(e).__name__}: {e}")
+
+    sent_at = datetime.now(timezone.utc).isoformat()
+    print(
+        f"[SUPPLIER] ✓ → {payload.supplier_name} <{payload.supplier_email}> "
+        f"{len(payload.items)} items batch_id={batch_id}",
+        flush=True,
+    )
+    return {
+        "ok": True,
+        "batch_id": batch_id,
+        "sent_at": sent_at,
+        "item_count": len(payload.items),
+        "subject": payload.subject,
+        "body_html": body_html,
+    }
+
+
+@app.get("/debug", dependencies=[Depends(check_auth)])
 def debug():
-    """Endpoint temporaire pour vérifier les variables d'environnement"""
+    """Endpoint de diagnostic env vars (auth requise)."""
     return {
         "odoo_url":    ODOO_URL  or "VIDE",
         "odoo_db":     ODOO_DB   or "VIDE",
         "odoo_user":   ODOO_USER or "VIDE",
         "api_key_set": bool(ODOO_API_KEY),
         "api_key_len": len(ODOO_API_KEY),
+        "smtp_host":   SMTP_HOST or "VIDE",
+        "smtp_user_set": bool(SMTP_USER),
+        "smtp_from_header":   SMTP_FROM_HEADER or "VIDE",
+        "smtp_from_envelope": SMTP_FROM_ENVELOPE or "VIDE",
     }
