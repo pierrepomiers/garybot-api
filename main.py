@@ -62,6 +62,7 @@ _SMTP_FROM_NAME, _SMTP_FROM_ADDR = parseaddr(SMTP_FROM)
 SMTP_FROM_HEADER   = SMTP_FROM or _SMTP_FROM_ADDR
 SMTP_FROM_ENVELOPE = _SMTP_FROM_ADDR
 SUPPLIER_REPLY_TO  = "contact@notoxsurf.com"
+CLIENT_REPLY_TO    = "contact@notoxsurf.com"
 
 # ─── AUTH GARYBOT ─────────────────────────────────────────────────────────────
 def check_auth(x_api_secret: str = Header(...)):
@@ -588,7 +589,7 @@ def post_order_message(order_id: int, payload: MessageIn):
             "auto_delete": False,
             "reply_to_force_new": False,
             "author_id": author_partner_id,
-            "reply_to": '"Pierre Pomiers" <pierre@notoxsurf.com>',
+            "reply_to": CLIENT_REPLY_TO,
         }
 
         context = {
