@@ -640,6 +640,11 @@ class CartItem(BaseModel):
     order_ref: Optional[str] = None
 
 
+class SupplierBlock(BaseModel):
+    note: Optional[str] = None
+    items: list[CartItem] = Field(..., min_length=1)
+
+
 class SupplierSendIn(BaseModel):
     supplier_key: str
     supplier_name: str
@@ -648,7 +653,7 @@ class SupplierSendIn(BaseModel):
     subject: str
     header: str
     footer: str
-    items: list[CartItem] = Field(..., min_length=1)
+    blocks: list[SupplierBlock] = Field(..., min_length=1)
     sent_by: Optional[str] = None
 
 
@@ -656,40 +661,68 @@ def _plain_text_to_html_paragraph(txt: str) -> str:
     return html.escape(txt or "").replace("\n", "<br>")
 
 
-def _build_supplier_body(header: str, footer: str, items: list[CartItem]) -> tuple[str, str]:
-    """Retourne (body_html, body_text) pour le mail fournisseur."""
-    rows_html: list[str] = []
-    rows_text: list[str] = []
-    for it in items:
-        label = html.escape(it.product_label or "").replace("\n", "<br>")
-        qty_s = (f"{it.qty:.2f}".rstrip("0").rstrip(".")) or "0"
-        ref = html.escape(it.order_ref or "")
-        rows_html.append(
-            "<tr>"
-            f'<td style="border:1px solid #ccc;padding:8px;">{label}</td>'
-            f'<td style="border:1px solid #ccc;padding:8px;text-align:right;">{qty_s}</td>'
-            f'<td style="border:1px solid #ccc;padding:8px;">{ref}</td>'
-            "</tr>"
-        )
-        rows_text.append(f"- {it.product_label} × {qty_s}" + (f"   ({it.order_ref})" if it.order_ref else ""))
+def _build_supplier_body(header: str, footer: str, blocks: list[SupplierBlock]) -> tuple[str, str]:
+    """Retourne (body_html, body_text) pour le mail fournisseur — multi-blocs."""
+    html_parts: list[str] = [
+        '<div style="font-family: Arial, sans-serif; color:#222; font-size:14px; line-height:1.5;">',
+        f'<p>{_plain_text_to_html_paragraph(header)}</p>',
+    ]
+    text_parts: list[str] = [header or ""]
 
-    body_html = (
-        '<div style="font-family: Arial, sans-serif; color:#222; font-size:14px; line-height:1.5;">'
-        f'<p>{_plain_text_to_html_paragraph(header)}</p>'
-        '<table style="border-collapse:collapse; width:100%; margin:16px 0;">'
-        '<thead>'
-        '<tr style="background:#f0f0f0;">'
-        '<th style="border:1px solid #ccc; padding:8px; text-align:left;">Article</th>'
-        '<th style="border:1px solid #ccc; padding:8px; text-align:right;">Qté</th>'
-        '<th style="border:1px solid #ccc; padding:8px; text-align:left;">Réf commande</th>'
-        '</tr>'
-        '</thead>'
-        f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table>'
-        f'<p>{_plain_text_to_html_paragraph(footer)}</p>'
-        '</div>'
-    )
-    body_text = (header or "") + "\n\n" + "\n".join(rows_text) + "\n\n" + (footer or "")
+    for i, block in enumerate(blocks):
+        if i > 0:
+            html_parts.append('<hr style="border:0;border-top:1px dashed #ccc;margin:20px 0;">')
+            text_parts.append("")
+            text_parts.append(f"─── Bloc {i + 1} ───")
+
+        rows_html: list[str] = []
+        rows_text: list[str] = []
+        for it in block.items:
+            label = html.escape(it.product_label or "").replace("\n", "<br>")
+            qty_s = (f"{it.qty:.2f}".rstrip("0").rstrip(".")) or "0"
+            ref = html.escape(it.order_ref or "")
+            rows_html.append(
+                "<tr>"
+                f'<td style="border:1px solid #ccc;padding:8px;">{label}</td>'
+                f'<td style="border:1px solid #ccc;padding:8px;text-align:right;">{qty_s}</td>'
+                f'<td style="border:1px solid #ccc;padding:8px;">{ref}</td>'
+                "</tr>"
+            )
+            rows_text.append(
+                f"- {it.product_label} × {qty_s}"
+                + (f"   ({it.order_ref})" if it.order_ref else "")
+            )
+
+        html_parts.append(
+            '<table style="border-collapse:collapse; width:100%; margin:8px 0;">'
+            '<thead>'
+            '<tr style="background:#f0f0f0;">'
+            '<th style="border:1px solid #ccc; padding:8px; text-align:left;">Article</th>'
+            '<th style="border:1px solid #ccc; padding:8px; text-align:right;">Qté</th>'
+            '<th style="border:1px solid #ccc; padding:8px; text-align:left;">Réf commande</th>'
+            '</tr>'
+            '</thead>'
+            f'<tbody>{"".join(rows_html)}</tbody>'
+            '</table>'
+        )
+        text_parts.append("")
+        text_parts.extend(rows_text)
+
+        if block.note:
+            html_parts.append(
+                '<p style="margin:4px 0 16px;font-style:italic;color:#555;">'
+                f'<strong>Note :</strong> {_plain_text_to_html_paragraph(block.note)}'
+                '</p>'
+            )
+            text_parts.append(f"Note : {block.note}")
+
+    html_parts.append(f'<p>{_plain_text_to_html_paragraph(footer)}</p>')
+    html_parts.append('</div>')
+    text_parts.append("")
+    text_parts.append(footer or "")
+
+    body_html = "".join(html_parts)
+    body_text = "\n".join(text_parts)
     return body_html, body_text
 
 
@@ -715,11 +748,15 @@ def post_supplier_cart_send(payload: SupplierSendIn):
             detail=f"SMTP non configuré : {', '.join(missing)} manquant",
         )
 
-    if not payload.items:
-        raise HTTPException(status_code=400, detail="items vide")
+    if not payload.blocks:
+        raise HTTPException(status_code=400, detail="blocks vide")
+
+    total_items = sum(len(b.items) for b in payload.blocks)
+    if total_items == 0:
+        raise HTTPException(status_code=400, detail="aucun article dans les blocs")
 
     batch_id = str(uuid.uuid4())
-    body_html, body_text = _build_supplier_body(payload.header, payload.footer, payload.items)
+    body_html, body_text = _build_supplier_body(payload.header, payload.footer, payload.blocks)
 
     msg = EmailMessage()
     msg["Subject"] = payload.subject
@@ -755,14 +792,14 @@ def post_supplier_cart_send(payload: SupplierSendIn):
     sent_at = datetime.now(timezone.utc).isoformat()
     print(
         f"[SUPPLIER] ✓ → {payload.supplier_name} <{payload.supplier_email}> "
-        f"{len(payload.items)} items batch_id={batch_id}",
+        f"{total_items} items / {len(payload.blocks)} blocs batch_id={batch_id}",
         flush=True,
     )
     return {
         "ok": True,
         "batch_id": batch_id,
         "sent_at": sent_at,
-        "item_count": len(payload.items),
+        "item_count": total_items,
         "subject": payload.subject,
         "body_html": body_html,
     }
